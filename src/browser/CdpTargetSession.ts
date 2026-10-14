@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { BrowserObservationEndpoint } from "../domain/browserObservation.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
@@ -10,6 +13,28 @@ import {
   type CdpEndpointDiscovery,
   type CdpEndpointTarget,
 } from "./CdpEndpoint.js";
+
+const resolveDevToolsActivePortSocketUrl = (httpEndpointUrl: string): string | null => {
+  try {
+    const parsed = new URL(httpEndpointUrl);
+    const activePortPath = join(
+      homedir(),
+      "Library",
+      "Application Support",
+      "Google",
+      "Chrome",
+      "DevToolsActivePort",
+    );
+    const lines = readFileSync(activePortPath, "utf8").trim().split(/\r?\n/u);
+    const port = lines[0]?.trim();
+    const wsPath = lines[1]?.trim() || "/devtools/browser";
+    if (!port) return null;
+    if (parsed.port && parsed.port !== port) return null;
+    return `ws://${parsed.hostname}:${port}${wsPath}`;
+  } catch {
+    return null;
+  }
+};
 
 /** One CDP connection scoped either by a flat browser session or page socket. */
 export interface CdpTargetSession {
@@ -37,11 +62,43 @@ export const openCdpEndpoint = async (
   signal?: AbortSignal,
   timeoutMs?: number,
 ): Promise<CdpOpenedEndpoint> => {
-  if (endpoint.transport === "http_discovery")
-    return {
-      discovery: await discoverCdpEndpoint(endpoint.url, operation, signal),
-      connection: undefined,
-    };
+  if (endpoint.transport === "http_discovery") {
+    try {
+      return {
+        discovery: await discoverCdpEndpoint(endpoint.url, operation, signal),
+        connection: undefined,
+      };
+    } catch (httpErr: unknown) {
+      const fallbackWsUrl = resolveDevToolsActivePortSocketUrl(endpoint.url);
+      if (!fallbackWsUrl) throw httpErr;
+      return await withCdpDiscoveryDeadline(
+        operation,
+        signal,
+        async (deadlineSignal) => {
+          const connection = await CdpConnection.connect(
+            fallbackWsUrl,
+            operation,
+            deadlineSignal,
+          );
+          try {
+            return {
+              discovery: await discoverCdpBrowserSocket(
+                connection,
+                fallbackWsUrl,
+                operation,
+                deadlineSignal,
+              ),
+              connection,
+            };
+          } catch (cause: unknown) {
+            await connection.close();
+            throw cause;
+          }
+        },
+        timeoutMs,
+      );
+    }
+  }
   return await withCdpDiscoveryDeadline(
     operation,
     signal,
